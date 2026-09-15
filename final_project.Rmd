@@ -1,0 +1,1478 @@
+---
+title: "Signal Attenuation in Generative Data Synthesis"
+subtitle: "What Survives When a Known Data-Generating Process Is Resampled by a Tabular Generative Model"
+author: "Aono Li"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+    toc_depth: 3
+    number_sections: true
+    code_folding: show
+    theme: flatly
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.align = "center", fig.width = 8, fig.height = 5
+)
+
+library(tidyverse)
+library(tidymodels)
+library(corrplot)
+library(vip)
+tidymodels_prefer()
+
+# All computationally expensive steps are run in the scripts under R/
+# and saved to disk. This report only reads the saved results.
+#
+# This file must be located at the project root alongside data/, R/, and
+# results/. Relative paths will fail if the report is moved elsewhere.
+need <- c("results/syn20.rds", "results/orig.rds", "results/eda.rds")
+gone <- need[!file.exists(need)]
+if (length(gone)) {
+  stop(
+    "\nMissing file(s): ", paste(gone, collapse = ", "),
+    "\nCurrent working directory: ", getwd(),
+    "\nPlace final_project.Rmd in the project root alongside data/, R/, and results/.",
+    "\nThen run R/01_load_sample.R followed by R/02_eda.R before knitting."
+  )
+}
+
+syn20 <- readRDS("results/syn20.rds")
+orig  <- readRDS("results/orig.rds")
+eda   <- readRDS("results/eda.rds")
+
+# Later sections depend on outputs created by the remaining scripts:
+#   Section 3    -> 03_split_recipe.R
+#   Sections 4-5 -> 04_tune_models.R
+#   Section 5    -> 05_final_fit.R, 05b_fix_vip.R, 05c_importance_vs_signal.R
+#   Section 6    -> 06_fidelity.R, 06b_fidelity_detail.R,
+#                   06c_categorical_marginals.R
+# Checking these files here gives a clear error before knitting reaches a
+# downstream chunk that would otherwise fail with an object-not-found error.
+need2 <- c("results/split.rds", "results/tuning.rds",
+           "results/final_fit.rds", "results/fidelity.rds")
+gone2 <- need2[!file.exists(need2)]
+if (length(gone2)) {
+  stop(
+    "\nMissing file(s): ", paste(gone2, collapse = ", "),
+    "\nRun the required scripts under R/ before knitting the report."
+  )
+}
+
+S      <- readRDS("results/split.rds")
+tuning <- readRDS("results/tuning.rds")
+final  <- readRDS("results/final_fit.rds")
+fid    <- readRDS("results/fidelity.rds")
+
+# Reuse the exact split and folds created in 03_split_recipe.R so that
+# Sections 3 and 4 refer to the same resampling objects.
+split <- S$split; train <- S$train; test <- S$test; folds <- S$folds
+```
+
+# Introduction
+
+## Motivation
+
+Synthetic data has become a routine part of machine learning practice. It is used
+to protect privacy when real records cannot be shared, to enlarge training sets
+when real observations are scarce, and — increasingly — to supply the teaching and
+benchmarking datasets on which students and practitioners learn their craft. Kaggle's
+monthly Playground Series, which supplies the primary dataset for this project, is
+generated in exactly this way: a deep generative model is trained on a real or
+semi-real source dataset and then used to produce a much larger synthetic version
+for competition. Hundreds of thousands of practitioners tune models against these
+datasets every month.
+
+What is far less often examined is how faithful the synthetic copy actually is. A
+generative model is trained to reproduce the *distribution* of its source data, but
+predictive modeling depends on something narrower and more fragile: the *conditional*
+relationship between predictors and an outcome. A synthesis that reproduces every
+histogram perfectly could still distort every regression coefficient. If that happens,
+the synthetic dataset will quietly mislead anyone who uses it to ask which variables
+matter, or how much accuracy a given problem permits. This project asks whether that
+distortion occurs here, and if so, in which direction and by how much.
+
+## Key concepts and vocabulary
+
+Because this report is written for readers who may be new to machine learning, the
+following terms are used throughout and are defined here.
+
+**Supervised regression** is the task of predicting a continuous *outcome* variable
+from a set of *predictor* variables, using observations for which the outcome is
+already known. Here the outcome is a student's exam score and the predictors are
+eleven measures of their study habits, lifestyle, and environment.
+
+**Root mean squared error (RMSE)** measures how far predictions fall from the truth.
+If $y_i$ is the observed outcome and $\hat{y}_i$ the prediction for observation $i$,
+then
+
+$$\text{RMSE} = \sqrt{\frac{1}{n}\sum_{i=1}^{n}(y_i - \hat{y}_i)^2}.$$
+
+It is expressed in the same units as the outcome, so an RMSE of 9 means that
+predictions are typically about nine exam points away from the true score. Lower is
+better. The related statistic $R^2$ reports the proportion of the outcome's variance
+that a model explains, on a scale from 0 to 1.
+
+**Training and testing sets.** A model that is evaluated on the same data used to fit
+it will flatter itself, because it can memorise rather than generalise. The standard
+remedy is to set aside a random portion of the data — the *testing set* — before any
+modeling begins, fit everything on the remaining *training set*, and look at the
+testing set exactly once, at the very end.
+
+**Cross-validation** solves a related problem. Model builders often need to compare
+many candidate models before choosing one, but every look at the testing set risks
+contaminating it. In *k-fold cross-validation* the training set is split into $k$
+equally sized folds; each fold in turn is held out while the model is fit on the other
+$k-1$, producing $k$ independent estimates of out-of-sample error that can be averaged.
+This gives an honest basis for comparison while leaving the testing set untouched.
+
+**Hyperparameters and tuning.** Most models have settings that are not learned from
+the data but must be chosen in advance — the number of neighbours in a k-nearest
+neighbors model, the depth of a decision tree, the strength of a penalty term. These
+are *hyperparameters*, and the process of searching over candidate values and selecting
+the best by cross-validation is *tuning*.
+
+**The bias–variance tradeoff** describes why more flexible models are not automatically
+better. A rigid model may systematically miss the true pattern (high *bias*); a highly
+flexible one may chase noise that happens to be present in the training sample and fail
+to generalise (high *variance*). The best model for a given dataset and sample size is
+the one that balances the two.
+
+**Censoring** occurs when an outcome is recorded only within fixed bounds, so that
+values beyond those bounds are recorded at the boundary instead. As Section 2 shows,
+the exam scores in both datasets are censored at an upper limit of 100 and a lower
+limit of 19.599, producing a pile-up of observations at each end.
+
+**Synthetic data and tabular generative models.** Synthetic data is generated by an algorithm
+rather than observed in the world. A *tabular generative model* such as CTGAN (Conditional
+Tabular Generative Adversarial Network) learns to produce rows that a discriminator network
+cannot distinguish from its training data. **Signal attenuation**,
+the phenomenon this report documents, refers to the systematic shrinkage of the
+association between predictors and outcome after such a synthesis.
+
+## An unusual experimental setup
+
+The two datasets used here are both synthetic, and this should be stated plainly at
+the outset: no part of this analysis involves real student records, and no conclusion
+drawn here should be read as a finding about actual educational outcomes.
+
+That limitation, however, creates an unusual opportunity. The source dataset was not
+observed but *constructed*: its documentation states that the exam score is derived
+from a weighted formula over the predictors. The competition dataset is understood to have
+been produced by training a deep tabular generative model on that source.
+
+This identification should be stated as an assumption rather than a documented fact. Kaggle's
+Playground Series is generated from a source dataset in this way by convention, and the two
+datasets here share an identical variable structure, identical outcome bounds, and — as Section
+6.2 shows — regression coefficients that agree to within a few per cent. A competitor's published
+write-up of this competition attributes the generation to CTGAN specifically. None of this is a
+statement from the competition organisers, however, so the analysis below is best read as
+comparing two datasets standing in a documented structural relationship, rather than as an
+audit of a generator whose training data is known with certainty. Section 6.6 returns to what
+this qualification does and does not affect. We therefore hold both ends of a
+generative pipeline — a data-generating process whose structure is known by
+construction, and the synthetic output of a model trained on it. Most studies of
+synthetic-data fidelity lack any ground truth and can only compare two opaque
+distributions to each other. Here, the ground truth is a formula, and departures from
+it are measurable.
+
+## Research questions
+
+**Primary.** When a dataset produced by a known weighted formula is regenerated by a
+deep generative model, which properties are preserved and which are systematically
+distorted?
+
+**Secondary.** At a matched sample size of 20,000 observations, does additional model
+complexity improve predictive accuracy, and how large is any gain over a simple linear
+baseline?
+
+The primary modeling task that anchors both questions is a supervised regression
+problem: predict a student's exam score from the eleven available predictors, and
+identify the model family best suited to doing so.
+
+## Data sources and citations
+
+**Primary modeling dataset.**
+
+> Kaggle. *Playground Series — Season 6, Episode 1: Predicting Student Test Scores.*
+> Kaggle, 2026. https://www.kaggle.com/competitions/playground-series-s6e1
+
+A synthetic dataset of 630,000 observations generated by a deep generative model.
+This project uses a stratified random sample of 20,000 rows, for reasons given in
+Section 3.1.
+
+**Comparison arm.**
+
+> Bedmutha, K. S. *Exam Score Prediction Dataset.* Kaggle, 2025.
+> https://www.kaggle.com/datasets/kundanbedmutha/exam-score-prediction-dataset
+
+A synthetic dataset of 20,000 observations in which the exam score is derived from a
+documented weighted formula over the predictors. It serves here as the ground-truth
+data-generating process against which the synthesis is compared.
+
+**Codebook.** A codebook documenting every variable in both datasets — its type, its range or
+set of levels, and its meaning — is submitted alongside this report as `codebook.md`.
+
+**External performance benchmarks.** Two publicly shared competition solutions are
+cited in Section 7 to place this project's accuracy in context. No code from either
+is used in this project.
+
+> Lim, Y. J. *First Loser (aka 4th place).* Kaggle, 2026.
+> https://www.kaggle.com/competitions/playground-series-s6e1/writeups/first-loser-aka-4th-place
+
+> lopure. *PS S6E1 | EDA + XGB — Last Competition Starter (as it is).* Kaggle, 2026.
+> https://www.kaggle.com/code/lopure/ps-s6e1-eda-xgb-last-competition-starter-as-it-is
+
+## Roadmap
+
+Section 2 explores both datasets, establishing three properties that govern everything
+that follows: the outcome is censored at both bounds, the relationship between the
+strongest predictor and the outcome is very close to linear, and five of the eleven
+predictors carry essentially no signal at all. Section 3 describes the sampling,
+train–test split, resampling scheme, and feature preprocessing. Section 4 fits and
+tunes five families of regression model, and Section 5 selects the best of them and
+evaluates it on data held out from the start. Section 6 then turns to the fidelity
+question that motivated the project, comparing the synthetic dataset against the source
+whose generating formula is known. Section 7 concludes.
+
+---
+
+# Exploratory Data Analysis
+
+This section examines the primary modeling dataset — the 20,000-row stratified sample
+of the competition data — and, where the comparison is informative, places it alongside
+the 20,000-row source dataset. Every figure and table is followed by its interpretation.
+
+## Distribution of the outcome
+
+```{r eda-hist}
+eda$p_hist
+```
+
+The distribution of exam scores is broadly symmetric and centred near 62, but it is not
+a clean bell curve. Both panels show a conspicuous spike at the extreme right, where a
+substantial group of students sits at exactly 100. A smaller pile-up occurs at the left
+edge. This is the visual signature of **censoring**: the generating process produces
+values that would fall outside the interval $[19.599, 100]$ and then clips them to the
+boundary.
+
+```{r eda-censor}
+knitr::kable(eda$censor_tbl,
+             caption = "Observations at the bounds of the outcome variable")
+```
+
+The counts make the pattern precise. In the synthetic sample, 505 students (2.52%) score
+exactly 100; in the source dataset, 493 (2.46%). At the lower bound, both datasets
+contain **exactly 200** observations at the value 19.599, and both share identical minima
+and maxima. The near-identical censoring behaviour is the first indication that the
+generative model reproduced the outcome's boundary structure with high fidelity.
+
+Censoring matters for what follows because it creates boundary-specific behaviour that an
+ordinary linear regression does not explicitly represent. Near the upper and lower limits,
+the relationship between the latent score and the recorded outcome is no longer linear because
+values beyond the limits are clipped to the boundary. This will become visible in the residual
+plots of Section 5, where the model shows systematic errors at the two censored limits.
+
+## Missing data
+
+```{r eda-missing}
+knitr::kable(eda$missing_tbl,
+             caption = "Missing values by variable and dataset")
+```
+
+**Neither dataset contains a single missing value in any of its twelve columns.** No
+imputation step is therefore required anywhere in the modeling pipeline, and the recipe
+in Section 3.4 contains no `step_impute_*()` call.
+
+This absence is worth pausing on rather than passing over. Real educational data is
+characteristically incomplete: students skip survey items, administrative records
+disagree, and attendance figures go unrecorded. A dataset of 20,000 student records with
+zero missingness in eleven behavioural and environmental variables is not a plausible
+real-world artifact. It is a property of synthetic generation, and it is the first of
+several respects in which these datasets are easier than the problem they represent.
+
+## Correlation structure among numeric variables
+
+```{r eda-corr, fig.width = 6, fig.height = 6}
+corrplot(eda$num_mat, method = "circle", type = "lower",
+         addCoef.col = "black", tl.col = "black", diag = FALSE, number.cex = .8)
+```
+
+Reading the bottom row first: `study_hours` is strongly associated with the outcome
+($r = 0.76$), `class_attendance` moderately so ($r = 0.36$), `sleep_hours` weakly
+($r = 0.16$), and `age` not at all ($r = 0.01$). A single predictor therefore accounts
+for the majority of the linear signal available in the numeric variables.
+
+The rest of the matrix is more surprising, and more diagnostic. **The predictors are
+essentially uncorrelated with one another.** The largest inter-predictor correlation is
+0.08, between `study_hours` and `class_attendance`; every other pair sits at 0.04 or
+below. In genuine educational data one would expect the opposite: conscientious students
+tend to both study more and attend more, so these two variables should be substantially
+correlated. Their near-independence here indicates that the predictors were drawn
+independently when the source dataset was constructed, rather than arising jointly from
+student behaviour.
+
+This has a practical consequence and an interpretive one. Practically, multicollinearity
+is a non-issue, so no predictor need be dropped and coefficient estimates will be stable.
+Interpretively, it removes one of the main reasons flexible models usually outperform
+linear ones — there are no correlated predictor clusters or interaction structures for a
+tree ensemble to exploit.
+
+## The shape of the strongest relationship
+
+```{r eda-shape}
+eda$p_shape
+```
+
+Dividing `study_hours` into sixteen equal-width bins and plotting the mean exam score in
+each produces a line that is very nearly straight. Mean scores rise from 40.10 in the
+lowest bin to 84.28 in the highest — a span of 44.2 points across 7.5 hours, or roughly
+**5.9 points per additional hour of daily study** — and the rate of increase is close to
+constant across the entire range. The dashed ordinary least-squares fit tracks the binned
+means closely, with only slight departures near the lower end.
+
+What is absent here is as important as what is present. There is no saturation at high
+study hours, no threshold below which studying does not help, and no curvature of any
+kind. A relationship of this shape is fully captured by a linear term. Flexible models
+such as random forests approximate smooth functions with piecewise-constant steps, which
+costs them accuracy precisely when the truth is a straight line. This figure is the
+strongest early evidence that a linear model will be difficult to beat.
+
+## Categorical predictors
+
+```{r eda-box, fig.height = 7}
+eda$p_box
+```
+
+The seven categorical predictors fall cleanly into two groups. Three show clear ordered
+gradients: scores rise from `poor` to `good` sleep quality, from `low` to `high` facility
+rating, and across study methods from self-study up to coaching. The other four —
+`course`, `gender`, `internet_access`, and `exam_difficulty` — produce boxes that are
+visually indistinguishable from one another, with medians, quartiles, and whiskers
+essentially aligned.
+
+The case of `exam_difficulty` deserves particular comment. Students who faced a `hard`
+paper score, on average, 62.60; those who faced an `easy` one score 62.26. The difference
+runs in the wrong direction and is negligible in size. Whatever else this dataset
+represents, the difficulty of the examination has no bearing on the score obtained.
+
+## Signal strength across all predictors
+
+```{r eda-signal}
+knitr::kable(eda$signal_tbl,
+             caption = "Signal strength of each predictor")
+```
+
+The table summarises each predictor's association with the outcome: Pearson correlation
+for numeric variables, and the range between the highest and lowest group mean, in exam
+points, for categorical ones. The two measures are not on a common scale, so they should
+be read within rather than across type; for a rough comparison, recall from Section 2.4
+that `study_hours` moves the mean outcome by 44.2 points across its range, far more than
+any categorical variable.
+
+Ranked by effect, the categorical predictors separate sharply:
+
+| Predictor | Group mean range (points) |
+|---|---|
+| `study_method` | 11.73 |
+| `sleep_quality` | 11.06 |
+| `facility_rating` | 8.77 |
+| `course` | 1.16 |
+| `gender` | 1.01 |
+| `exam_difficulty` | 0.34 |
+| `internet_access` | 0.18 |
+
+There is roughly an eightfold gap between the third variable and the fourth. Taken
+together with the numeric correlations, **six of the eleven predictors carry usable
+signal and five carry essentially none**: `age`, `gender`, `course`, `internet_access`,
+and `exam_difficulty` each move the expected outcome by about one point or less, against
+an outcome standard deviation of nearly 19.
+
+This finding sits awkwardly with the source dataset's own documentation, which states
+that limited internet access and poor facilities create a disadvantage and that harder
+examination papers reduce achievable scores. Facilities do matter, and substantially.
+Internet access and exam difficulty do not appear to enter the generating process at all.
+The stated description of the data and the data itself disagree — a discrepancy returned
+to in Section 6.
+
+## Comparing the two datasets
+
+```{r eda-kde, fig.height = 5}
+eda$p_kde
+```
+
+```{r eda-quant}
+knitr::kable(eda$quant_tbl, caption = "Marginal distributions compared")
+```
+
+The source dataset's predictor distributions are visibly **uniform**: `study_hours`,
+`class_attendance`, and `sleep_hours` all have flat densities across their ranges, and
+`age` is uniform over the integers 17 to 24. This is consistent with a constructed
+dataset in which predictors were drawn independently from uniform distributions and the
+outcome computed from them.
+
+Against that flat baseline, the quality of the synthesis varies sharply by variable.
+
+**The outcome is reproduced almost exactly.** The two `exam_score` densities lie on top
+of one another across the entire range, and the quartiles agree to within a tenth of a
+point: 48.70 / 62.60 / 76.30 in the synthetic sample against 48.80 / 62.60 / 76.30 in the
+source. Means differ by 0.02 and standard deviations by 0.01.
+
+**The predictor marginals are reproduced less well.** Two distinct artifacts are visible.
+First, the synthetic densities *ripple*: where the source distributions are flat, the
+synthetic versions show regular waves, with spurious local modes in `study_hours` and
+`sleep_hours` and exaggerated peaks in the `age` spikes. These are characteristic mode
+artifacts of adversarial generators, which tend to concentrate probability mass at values
+they have learned to reproduce convincingly. Second, and more consequentially,
+`class_attendance` is **systematically shifted upward**: its median moves from 69.90 to
+72.40 and its mean from 70.02 to 71.97, with the density plot showing a large accumulation
+of mass against the upper boundary near 100 and a corresponding depression around 55 to 65.
+
+The summary, then, is not that the synthesis is faithful, but that its fidelity is
+uneven: nearly perfect for the outcome, good for most predictors, and measurably
+distorted for `class_attendance`. Whether the *conditional* relationships between
+predictors and outcome survived as well as the marginal distributions did is a separate
+question, and one the marginal plots cannot answer. Section 6 addresses it directly.
+
+---
+
+# Data Splitting and Cross-Validation
+
+## Why a 20,000-row sample
+
+The competition dataset contains 630,000 observations. Rather than use all of them, this
+project draws a stratified random sample of 20,000 rows, for two reasons.
+
+The first is experimental design. The comparison arm — the source dataset — contains
+exactly 20,000 observations. Because model performance depends on sample size (a point
+Section 7 develops at length), comparing a model fit to 630,000 synthetic rows against
+one fit to 20,000 source rows would confound the effect of the synthesis with the effect
+of sample size. Matching the two at 20,000 removes that confound.
+
+The second is computational. Tuning five model families over cross-validated grids
+requires fitting each candidate model many hundreds of times. At 20,000 observations this
+is feasible on a single machine within an hour; at 630,000 it is not.
+
+```{r split-sample-check}
+eda$quant_tbl %>%
+  filter(variable == "exam_score") %>%
+  knitr::kable(caption = "Outcome distribution preserved in the stratified sample")
+```
+
+The sample was drawn by dividing the full dataset into deciles of the outcome and taking
+2,000 observations from each, so the distribution of `exam_score` in the sample matches
+that of the population it was drawn from.
+
+## The training–testing split
+
+```{r split}
+split <- S$split
+train <- S$train
+test  <- S$test
+
+c(training = nrow(train), testing = nrow(test))
+```
+
+The split and the resampling folds were created in `R/03_split_recipe.R` and are loaded here,
+rather than recreated, so that this report and the tuning in Section 4 refer to the same
+objects. The code that produced them is reproduced below.
+
+```{r split-code, eval = FALSE}
+set.seed(131)
+
+# Training-testing split, stratified on the outcome
+split <- initial_split(syn20, prop = 0.80, strata = exam_score)
+train <- training(split)
+test  <- testing(split)
+
+# Resampling folds, stratified on the outcome as well
+folds <- vfold_cv(train, v = 5, strata = exam_score)
+```
+
+The sample is divided into a training set of 15,999 observations (80%) and a testing set of
+4,001 (20%). The counts are not exactly 16,000 and 4,000 because the split is stratified:
+the data are divided into bands of the outcome and each band is split in proportion, so the
+remainders do not sum to a round number. Every choice made in the remainder of this report —
+which predictors to use, which models to fit, which hyperparameter values to adopt — is made
+using the training set alone. The testing set is examined exactly once, in Section 5, to
+obtain an honest estimate of how the selected model would perform on data it has never seen.
+
+Stratifying on the outcome matters here. Under a simple random split, the training and
+testing sets would by chance contain slightly different proportions of high- and low-scoring
+students, and any difference in measured performance would partly reflect that imbalance
+rather than the model. Stratification instead splits within bands of the outcome, so that the
+distribution of exam scores is close to identical in both sets. With a censored outcome this
+matters more than usual: the observations piled up at 100 are the hardest to predict, and an
+unlucky split could concentrate them disproportionately in one set.
+
+```{r split-strata-check}
+bind_rows(
+  train %>% summarise(set = "Training", n = n(), mean = mean(exam_score),
+                      sd = sd(exam_score), q25 = quantile(exam_score, .25),
+                      median = median(exam_score), q75 = quantile(exam_score, .75)),
+  test  %>% summarise(set = "Testing",  n = n(), mean = mean(exam_score),
+                      sd = sd(exam_score), q25 = quantile(exam_score, .25),
+                      median = median(exam_score), q75 = quantile(exam_score, .75))
+) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3))) %>%
+  knitr::kable(caption = "Outcome distribution in the training and testing sets")
+```
+
+The check confirms that stratification worked. Mean exam scores differ between the two sets
+by 0.03 points and standard deviations by 0.13, against an outcome that ranges across more
+than eighty points. All three quartiles — 48.7, 62.6 and 76.3 — are identical in both sets.
+Any difference in performance observed in Section 5 can therefore be attributed to the model
+rather than to an accident of the split.
+
+## k-fold cross-validation
+
+```{r folds}
+folds <- S$folds
+folds
+```
+
+Choosing among five model families, each with its own hyperparameters, requires comparing
+many candidates — and each comparison needs an estimate of how the candidate would perform
+on unseen data. The testing set cannot supply these estimates, because using it repeatedly
+to make choices would turn it into a second training set and destroy its value as an
+impartial final check.
+
+Five-fold cross-validation solves this using the training set alone. The 15,999 training
+observations are divided into five folds of roughly 3,200. A model is then fit five times: on the
+first pass, folds 2 through 5 are used for fitting and fold 1 is held out for evaluation;
+on the second pass, fold 2 is held out; and so on. Each observation is used for fitting
+four times and for evaluation once, and the five resulting RMSE values are averaged. The
+average is a far more stable estimate than any single held-out sample would provide, and
+the spread across folds gives a standard error that indicates how much confidence to place
+in small differences between models.
+
+Five folds were chosen over the equally common ten for two reasons. The practical one is
+cost: tuning five model families over three-dimensional hyperparameter grids requires
+fitting several thousand models, and halving the number of folds halves that work. The
+statistical one is that the choice involves a tradeoff rather than a clear winner. With
+five folds each model is fit on 80% of the training data rather than 90%, so the resulting
+error estimate is slightly **pessimistic** — it describes a model trained on less data than
+the one eventually deployed. In exchange, the five estimates being averaged are less
+correlated with one another than ten would be, which makes their average less variable.
+Since every model here is compared on identical folds, any small pessimistic bias applies
+equally to all of them and cannot change the ranking.
+
+The folds are stratified on the outcome for the same reason the initial split was: to
+prevent chance variation in the composition of folds from being mistaken for variation in
+model quality.
+
+## The recipe
+
+```{r recipe}
+rec <- recipe(exam_score ~ ., data = train) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+
+rec
+```
+
+A `recipe` specifies the preprocessing applied to the predictors before any model sees
+them. Two steps are required here, and their order matters.
+
+**`step_dummy()`** converts each categorical predictor into numeric indicator columns,
+since none of the five model families can consume a factor directly. A variable with $k$
+levels becomes $k - 1$ indicators rather than $k$: one level is absorbed into the intercept
+as a reference category. This is deliberate and is the default. Creating all $k$ indicators
+— *one-hot* encoding — makes their sum identically equal to the intercept column, so the
+design matrix $X$ loses full column rank, $X^{\top}X$ becomes singular, and the ordinary
+least-squares coefficients are not uniquely defined. Tree ensembles tolerate one-hot
+encoding, but linear and penalised linear models do not, and a single recipe serves all
+five families here.
+
+For the same reason, `sleep_quality`, `facility_rating`, and `exam_difficulty` are stored
+as ordinary factors with their levels placed in meaningful order, rather than as `ordered`
+factors. R applies polynomial contrasts to ordered factors by default, which would yield
+linear and quadratic trend terms in place of the interpretable indicator variables intended
+here.
+
+**`step_normalize()`** centres each numeric predictor at zero and scales it to unit standard
+deviation. Two of the five model families are particularly sensitive to predictor scale. Elastic net applies a penalty to
+the magnitude of the coefficients, so predictors measured on larger scales would be penalised
+less simply by virtue of their units; `class_attendance` runs from 40 to 99 while
+`study_hours` runs from 0 to 8, and without scaling the penalty would fall almost entirely
+on the latter. K-nearest neighbors computes distances between observations, which are
+meaningless unless the dimensions are commensurable. Linear regression and the tree
+ensembles are unaffected by the transformation, so applying it uniformly costs nothing.
+
+Normalisation follows dummy encoding so that the indicator columns are created before
+scaling is applied. All recipe steps are estimated from the training data only and then
+applied unchanged to the testing data, so that no information from the testing set can
+influence preprocessing.
+
+```{r recipe-prep}
+ncol(bake(prep(rec), new_data = NULL)) - 1
+```
+
+After preprocessing, the eleven original predictors expand to 23 columns: the four numeric
+variables and nineteen indicators. The indicator counts follow the $k - 1$ rule described
+above — `gender` contributes two columns rather than three, `course` six rather than seven,
+`study_method` four rather than five — with the omitted level of each variable serving as its
+reference category.
+
+---
+
+# Model Fitting
+
+## The five model families
+
+Five families of model are fitted to the training data. All five are regression
+methods, and all are set to `mode = "regression"` in `parsnip`. This is worth
+stating explicitly because the course's model catalogue also contains classification
+methods — logistic regression, linear and quadratic discriminant analysis — which
+predict class membership rather than a numeric value and are therefore inapplicable
+to a continuous outcome such as an exam score. Clustering methods and principal
+component analysis are likewise excluded: they are unsupervised, and this is a
+supervised prediction problem.
+
+The five families were chosen to span the range from strong structural assumptions
+to none at all, because the exploratory analysis in Section 2 raised a specific
+question that only such a spread can answer. If the data-generating process really
+is close to linear and additive, as Section 2.4 suggested, the more flexible families
+should gain little and may lose something; if it is not, they should pull ahead
+decisively.
+
+**Linear regression** serves as the baseline. It assumes the expected outcome is a
+weighted sum of the predictors, and it has no hyperparameters to tune. Its bias is
+high whenever the truth departs from that form, but its variance is very low: with
+16,000 observations and 23 predictors, its coefficients are estimated with great
+precision. Given the near-straight relationship documented in Section 2.4, this is a
+serious contender rather than a straw man.
+
+**Elastic net** is linear regression with a penalty added to the size of the
+coefficients. The penalty combines an $\ell_1$ term, which can shrink coefficients
+exactly to zero and thereby perform variable selection, and an $\ell_2$ term, which
+shrinks them smoothly toward zero without eliminating them. Two hyperparameters
+control it: `penalty` sets the overall strength of the shrinkage, and `mixture` sets
+the balance between the two terms, with 0 giving pure ridge regression and 1 pure
+lasso. This family is directly relevant here because Section 2.6 identified five
+predictors that carry essentially no signal. If discarding them helps, elastic net
+should find a penalty that does so and should beat unpenalised linear regression.
+
+**K-nearest neighbors** makes no assumption about functional form at all. To predict
+a new observation it finds the `neighbors` training observations closest to it in
+predictor space and averages their outcomes. Small values of `neighbors` produce a
+highly flexible, high-variance fit; large values produce a smoother, higher-bias one.
+Its known weakness is dimensionality: in a 23-dimensional predictor space, even
+16,000 points are sparse, and the nearest neighbours of a given observation may not
+be very near. It is included partly as a contrast — a purely local method set against
+globally structured ones — and partly because the curse of dimensionality is itself
+worth demonstrating.
+
+**Random forest** builds many decision trees on bootstrap resamples of the training
+data and averages their predictions. At each split, only a random subset of `mtry`
+predictors is considered, which decorrelates the trees and makes their average more
+stable than any single tree. Three hyperparameters are tuned: `mtry`, the number of
+predictors offered at each split; `trees`, the number of trees in the ensemble; and
+`min_n`, the minimum number of observations a node must contain to be split further.
+Random forests capture interactions and nonlinearity automatically, without being
+told to look for them. Their structural cost is that a tree approximates any smooth
+function by a piecewise-constant staircase, which is inefficient when the truth is a
+straight line.
+
+**Boosted trees** also build an ensemble, but sequentially rather than in parallel:
+each new tree is fitted to the residuals left by the ensemble so far, so the model
+concentrates its effort where it is currently doing worst. Three hyperparameters are
+tuned: `trees`, `tree_depth`, which caps how many splits deep any single tree may go
+and therefore the order of interaction the model can represent, and `learn_rate`,
+which scales each tree's contribution. A low learning rate with many trees usually
+generalises better than a high rate with few. Gradient boosting is generally the
+strongest performer on tabular data of this kind, and it is the family the leading
+competition solutions relied on.
+
+
+Every model is fitted to the same five folds of the training set, using the recipe from
+Section 3.4, and evaluated by the same metric. Each family with hyperparameters is tuned by
+searching a grid of candidate values and selecting the combination with the lowest
+cross-validated RMSE. All tuning results were computed in `R/04_tune_models.R` and stored;
+this report reads them rather than recomputing them.
+
+For the two tree ensembles, a space-filling design of 25 candidate combinations is used in
+place of an exhaustive grid. With three hyperparameters to vary, an exhaustive grid at four
+levels each would require 64 combinations, most of them clustered along the axes of the space.
+A space-filling design spreads the same search effort more evenly through the interior of the
+three-dimensional region, which gives better coverage per model fitted.
+
+## Linear regression
+
+```{r fit-lm}
+collect_metrics(tuning$lm) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 4))) %>%
+  knitr::kable(caption = "Cross-validated performance of the linear baseline")
+```
+
+With no hyperparameters, linear regression is fitted once per fold and requires no tuning. It
+establishes the standard the other four families must beat.
+
+## Elastic net
+
+```{r fit-en}
+autoplot(tuning$en, metric = "rmse")
+```
+
+```{r fit-en-best}
+select_best(tuning$en, metric = "rmse") %>%
+  knitr::kable(caption = "Selected elastic net hyperparameters")
+```
+
+The tuned model selects `penalty` = 0.001 with `mixture` = 1. Both values are worth reading
+carefully. A `mixture` of 1 is pure lasso, the variant that can eliminate predictors outright;
+a `penalty` of 0.001 is the **smallest value in the search grid**, meaning the penalty is as
+close to zero as the tuning was permitted to make it. In other words, the elastic net was
+offered the opportunity to shrink or discard predictors and declined it: the selected model is
+ordinary least squares in all but name, and its cross-validated RMSE is identical to the linear
+baseline to four decimal places.
+
+This is a substantive result rather than a null one. Section 2.6 identified five predictors
+carrying no signal, and regularisation is the standard remedy for exactly that situation. That
+it provides no benefit here reflects the sample size: with 15,999 observations and 23
+predictors, the variance introduced by estimating a handful of coefficients that are truly zero
+is negligible, so there is nothing for shrinkage to recover. The bias it would introduce on the
+eleven genuine coefficients outweighs any variance it could save.
+
+## K-nearest neighbors
+
+```{r fit-knn}
+autoplot(tuning$knn, metric = "rmse")
+```
+
+```{r fit-knn-best}
+select_best(tuning$knn, metric = "rmse") %>%
+  knitr::kable(caption = "Selected number of neighbours")
+```
+
+The optimal neighbourhood size is 34. The tuning curve has the characteristic shape: very small
+neighbourhoods produce high-variance predictions that track noise in individual training points,
+and very large ones smooth away real structure, with a minimum in between.
+
+That minimum, however, is poor in absolute terms, as Section 4.7 shows. The reason is
+dimensionality. After dummy encoding there are 23 predictors, and in a 23-dimensional space
+even 12,800 training points are extremely sparse: the 34 "nearest" neighbours of a given
+observation are not, in any meaningful sense, near it. Distance-based methods rely on the
+premise that nearby points have similar outcomes, and that premise weakens rapidly as
+dimensions accumulate.
+
+## Random forest
+
+```{r fit-rf}
+autoplot(tuning$rf, metric = "rmse")
+```
+
+```{r fit-rf-best}
+select_best(tuning$rf, metric = "rmse") %>%
+  knitr::kable(caption = "Selected random forest hyperparameters")
+```
+
+The selected forest uses `mtry` = 8 predictors per split, `trees` = 575, and a minimum node
+size of 22. The value of `mtry` sits well below the 23 available, confirming that
+decorrelating the trees helps; a forest that considered every predictor at every split would
+be bagging rather than a random forest, and would produce more highly correlated trees whose
+average is less stable.
+
+## Boosted tree
+
+```{r fit-bt}
+autoplot(tuning$bt, metric = "rmse")
+```
+
+```{r fit-bt-best}
+select_best(tuning$bt, metric = "rmse") %>%
+  knitr::kable(caption = "Selected boosted tree hyperparameters")
+```
+
+The selected configuration uses 616 trees at a learning rate of 0.059 — a moderate rate with
+a moderate number of trees, the usual well-behaved combination — and a `tree_depth` of **2**,
+which is the smallest depth the search grid allowed.
+
+That last value deserves emphasis. Tree depth controls the highest order of interaction a
+boosted model can represent: a depth of 1 fits a purely additive model, depth 2 permits
+two-way interactions, and so on. The tuning selected the shallowest trees available, and did
+so despite having depths up to 8 on offer. The model is telling us that interaction structure,
+which is the principal advantage boosting holds over an additive model, is not present in
+these data in any quantity worth capturing. This corroborates Section 2.3, where the predictors
+proved almost entirely uncorrelated with one another, and Section 2.4, where the dominant
+predictor's relationship with the outcome proved almost perfectly straight.
+
+## Cross-validated performance
+
+```{r fit-summary}
+tuning$summary_tbl %>%
+  mutate(`Difference from best` = round(mean - min(mean), 4),
+         `In standard errors`   = round((mean - min(mean)) / std_err, 1)) %>%
+  knitr::kable(caption = "Cross-validated RMSE across the five model families")
+```
+
+The five families separate into three clear tiers.
+
+**The top tier is a three-way tie.** Linear regression and elastic net achieve identical
+cross-validated RMSE of 8.8534 — unsurprisingly, since the tuned elastic net *is* ordinary
+least squares. The boosted tree reaches 8.8626, which is 0.009 worse, or about one sixth of a
+standard error. No meaningful distinction can be drawn between these three: the gap is an
+order of magnitude smaller than the uncertainty in any of the estimates.
+
+**The random forest falls clearly behind**, at 9.3250. The gap of 0.47 RMSE is roughly 7.6
+standard errors, which is not a matter of interpretation. The explanation is structural rather
+than accidental. A regression tree approximates a function by partitioning the predictor space
+and predicting a constant within each region, so a smooth linear relationship is represented as
+a staircase. Section 2.4 established that the dominant relationship in these data is almost
+exactly linear; the forest must spend its flexibility reconstructing a straight line out of
+steps, which costs accuracy it cannot recover elsewhere, because Section 2.3 showed there is
+almost no interaction structure for it to exploit in compensation. The boosted tree avoids most
+of this penalty by fitting shallow trees sequentially to residuals, which approximates an
+additive model far more efficiently than bagging deep trees does.
+
+**K-nearest neighbors fails badly**, at 12.0347 — some 3.18 RMSE behind the leaders, or over
+fifty standard errors. Its predictions are barely better than one would obtain from the
+predictors that matter most alone. This is the curse of dimensionality operating exactly as
+theory describes.
+
+Taken together, the ranking inverts the intuition that more flexible models perform better.
+The two most flexible families here occupy the bottom two positions, and the least flexible
+family shares first place. The reason is not that flexibility is bad, but that flexibility is
+only worth its variance cost when there is structure to find. Sections 2.3, 2.4 and 4.6 all
+point to the same conclusion: in this dataset, there is very little.
+
+---
+
+# Model Selection and Test-Set Performance
+
+
+> All model selection and test-set evaluation reported in this section is performed on
+> the primary dataset. The source dataset enters only as a comparison arm in the fidelity
+> analysis that follows.
+
+## Selecting the best model
+
+Section 4.7 left three families statistically indistinguishable at the top. The lowest
+cross-validated RMSE belongs to the elastic net, and that is the model carried forward. Its
+selected configuration, however, makes the choice less consequential than it appears.
+
+```{r sel-best}
+final$best_par %>% knitr::kable(caption = "Configuration of the selected model")
+```
+
+The tuned elastic net uses a penalty of 0.001, the smallest value the search grid contained.
+At that strength the shrinkage is numerically negligible, and the fitted model coincides with
+ordinary least squares — which is why its cross-validated RMSE matches the linear baseline to
+four decimal places. The model carried into the testing set is, in substance, a linear
+regression. Nothing in the conclusions below would change had the linear baseline been selected
+instead.
+
+Only this one model is used to predict the testing set. The other four are not, and their
+testing performance is not computed or reported. Fitting several candidates to held-out data
+and then reporting the best of them would reintroduce exactly the selection bias that holding
+data out is meant to prevent.
+
+## Performance on the testing set
+
+```{r test-metrics}
+final$test_metrics %>%
+  knitr::kable(caption = "Performance of the selected model on the testing set")
+```
+
+On the 4,001 observations withheld at the outset, the model achieves an RMSE of 8.740, an
+$R^2$ of 0.784, and a mean absolute error of 6.991. Predictions are typically within about
+seven exam points of the truth, and the model accounts for roughly 78% of the variation in
+exam scores.
+
+The ratio of RMSE to MAE is 1.250. For normally distributed errors this ratio is
+$\sqrt{\pi/2} \approx 1.253$, so the observed ratio is consistent with a roughly normal bulk
+error distribution. The ratio alone, however, is not a diagnostic of normality; the residual
+plots below provide the more informative check and show that the clearest departures are
+concentrated at the censored boundaries.
+
+```{r test-vs-cv}
+tibble(
+  Quantity = c("Cross-validated RMSE (5 folds)", "Testing RMSE", "Difference"),
+  Value = round(c(final$cv_rmse,
+                  final$test_metrics$.estimate[final$test_metrics$.metric == "rmse"],
+                  final$test_metrics$.estimate[final$test_metrics$.metric == "rmse"] - final$cv_rmse), 4)
+) %>% knitr::kable(caption = "Cross-validated and testing error compared")
+```
+
+The testing RMSE is 0.114 **lower** than the cross-validated estimate. Test error coming in
+better than expected is less alarming than the reverse, and two things explain it. The first is
+structural: each cross-validation fit used four fifths of the training set, or about 12,800
+observations, whereas the final model was fitted to all 15,999. More training data yields a
+slightly better model, so the cross-validated figure is mildly pessimistic by construction — as
+anticipated in Section 3.3. The second is sampling variation: the difference amounts to roughly
+1.8 cross-validation standard errors, which is unremarkable for a single held-out sample of
+4,001 observations.
+
+What matters for the project's argument is that the two figures agree closely. There is no sign
+of overfitting, which is what one would expect given that the selected model has 23 coefficients
+estimated from 15,999 observations and no effective penalty.
+
+## Residual diagnostics
+
+```{r resid-plot}
+final$p_resid
+```
+
+The residuals show no curvature, no funnelling, and no drift across the range of fitted values —
+the linear specification is not systematically wrong anywhere in the interior. What the plot does
+show, unmistakably, are two sharp diagonal boundaries at the upper right and lower left. These
+are the censoring of the outcome made visible. An observation recorded at exactly 100 has residual
+$100 - \hat{y}$, which traces a line of slope $-1$ against $\hat{y}$; the same holds at the lower
+bound with the opposite sign. No observation can lie beyond those lines, because no outcome
+beyond the bounds exists in the data.
+
+```{r obs-pred-plot, fig.height = 6}
+final$p_obs_pred
+```
+
+The same structure appears in the observed-against-predicted plot as two horizontal bands of
+points at $y = 100$ and $y \approx 19.6$, stretching across a wide range of predicted values.
+Elsewhere the cloud is centred on the diagonal with no visible bias.
+
+```{r resid-region}
+final$preds %>%
+  mutate(.resid = exam_score - .pred,
+         Region = case_when(exam_score == 100 ~ "At upper bound (100)",
+                            exam_score <= 20  ~ "At lower bound (19.6)",
+                            TRUE              ~ "Interior")) %>%
+  group_by(Region) %>%
+  summarise(n = n(),
+            `Mean residual` = round(mean(.resid), 3),
+            `SD of residual` = round(sd(.resid), 3), .groups = "drop") %>%
+  knitr::kable(caption = "Residuals by region of the outcome")
+```
+
+Quantifying the effect: across the 3,863 interior observations the mean residual is $-0.44$,
+close to zero as it should be. At the upper bound the mean residual is $+8.31$, and at the lower
+bound $-9.71$. The model systematically under-predicts students who scored 100 and over-predicts
+those at the floor.
+
+This is not a failure of the model so much as a consequence of what the outcome measures.
+A student recorded at 100 may have had a latent score of 105 or 115; the recording process cannot
+distinguish them. A linear model fitted to the clipped outcomes learns the conditional mean of the
+observed, censored response rather than the latent uncensored score, so it does not explicitly
+account for the censoring mechanism at the boundaries. The affected observations are a small
+minority — 89 at the ceiling and 49 at the floor out of 4,001, about 3.4% combined — but they
+reveal a systematic boundary pattern that the ordinary linear specification does not model directly.
+A censored-regression specification could address this mechanism explicitly and is therefore a
+natural extension considered in Section 7.4.
+
+## Variable importance
+
+```{r vip-plot, fig.height = 6}
+final$p_vip
+```
+
+```{r vip-tbl}
+final$vip_tbl %>% head(12) %>%
+  knitr::kable(caption = "Twelve most important predictors (random forest, impurity)")
+```
+
+Variable importance is computed from the tuned random forest fitted to the training set. The
+random forest is used here rather than the selected model because impurity-based importance is a
+property of tree ensembles; no testing data is involved, so this does not conflict with the single
+model used in Section 5.2.
+
+The ranking broadly confirms the exploratory analysis. `study_hours` dominates overwhelmingly, at
+more than four times the importance of `class_attendance` in second place, which in turn leads
+`sleep_hours` and `sleep_quality_good`. The signal-carrying predictors identified in Section 2.6
+occupy the top of the table and the null ones cluster at the bottom.
+
+Two entries do not fit, however, and both are instructive.
+
+**`age` ranks sixth** — ahead of every indicator for `study_method` — yet Section 2.6 measured its
+correlation with the outcome at 0.010 and Section 6 estimated its regression coefficient at 0.002.
+By every direct measure it is noise. And **`sleep_hours` ranks third**, ahead of `sleep_quality`,
+even though the latter explains more than twice as much of the outcome's variance.
+
+```{r vip-diag}
+final$imp_cmp %>%
+  knitr::kable(caption = "Importance rank against explanatory power and number of distinct values")
+```
+
+```{r vip-diag-plot}
+final$p_imp_signal
+```
+
+To compare the predictors on one scale, the table reports the proportion of outcome variance each
+explains on its own — $r^2$ for numeric predictors and $\eta^2$ for categorical ones. On that
+measure, `sleep_quality` explains 5.8% of the outcome's variance against `sleep_hours`' 2.7%, and
+`study_method` explains 5.0% against `age`'s 0.01%. Both pairs are ranked the wrong way round by
+importance.
+
+What the two displaced variables have in common is that they take many values. `sleep_hours` takes
+59 distinct values in this sample and `age` takes 8, while every categorical predictor has been
+reduced to indicators taking exactly two. Impurity-based importance accumulates the reduction in
+node impurity a variable achieves across all splits, and a variable with more distinct values
+offers more places to split. It therefore accumulates a larger total simply by being available more
+often, even when no individual split captures anything real. This bias is well documented for
+impurity-based measures.
+
+The effect should not be overstated. Across all eleven predictors the importance ranking correlates
+with genuine explanatory power at a Spearman coefficient of 0.858, against 0.707 for the number of
+distinct values — the ranking is mostly tracking signal, not cardinality. But "mostly" is doing
+work in that sentence. The two exceptions are not at the margins of the table; one of them is a
+variable with no relationship to the outcome whatsoever, sitting in sixth place out of twenty-three.
+
+The practical lesson is that importance rankings are evidence, not verdicts, and they should be read
+alongside direct measures rather than in place of them. Had this project relied on the importance
+plot alone, `age` would have been reported as a meaningful determinant of exam performance. The
+exploratory analysis in Section 2 and the coefficient estimates in Section 6 both say otherwise, and
+they are right. A permutation-based importance measure, which is not subject to the same
+cardinality bias, would be the natural cross-check.
+
+---
+
+# Fidelity Analysis
+
+Sections 2 through 5 treated the competition dataset as the object of study. This section
+turns to the question that motivated the project: what did the generative model preserve,
+and what did it change? Because the source dataset's outcome is constructed from a weighted
+formula over the predictors, its conditional structure is a ground truth against which the
+synthesis can be measured. Both datasets contain exactly 20,000 observations, so nothing in
+what follows is attributable to a difference in sample size.
+
+The comparison uses ordinary least squares fitted separately to each dataset under an
+identical recipe. Because predictors are standardised, each coefficient reports the change
+in exam score associated with a one-standard-deviation change in that predictor, and the two
+sets of coefficients are directly comparable. No testing data is involved anywhere in this
+section, and no model selection depends on it.
+
+## Marginal distributions
+
+Section 2.7 established that the outcome's marginal distribution survived the synthesis
+almost perfectly — quartiles agreeing to within a tenth of a point — while the numeric
+predictors fared less well, with spurious ripples appearing on distributions that were
+uniform in the source and `class_attendance` shifting upward by roughly two points.
+
+The categorical predictors show the same unevenness, and more sharply.
+
+```{r fid-cat}
+fid$p_cat
+```
+
+```{r fid-tvd}
+knitr::kable(fid$tvd,
+             caption = "Total variation distance between the two datasets, in percentage points")
+```
+
+Total variation distance summarises how far two categorical distributions are apart: it is
+half the sum of the absolute differences in the proportion assigned to each level, so a value
+of 0 means the distributions are identical and a value of 14 means that fourteen per cent of
+the probability mass would have to be moved to reconcile them.
+
+Three variables are reproduced almost exactly — `study_method`, `sleep_quality` and
+`facility_rating` are all uniform across their levels in the source and remain so in the
+synthesis. `gender` likewise survives unchanged. But `course`, which is very nearly uniform
+in the source with each of its seven programmes holding about fourteen per cent of students,
+becomes badly lopsided in the synthesis, ranging from under eight per cent to over twenty.
+`internet_access` and `exam_difficulty` are distorted substantially as well.
+
+The pattern is worth noting even though it cannot be treated as a rule from a single
+dataset. The three worst-reproduced categorical variables — `course`, `internet_access`,
+`exam_difficulty` — are three of the five predictors that Section 2.6 identified as carrying
+no signal. The three best-reproduced ones are exactly the three categorical predictors that
+do carry signal. A plausible reading is that the generator, trained to produce rows a
+discriminator cannot distinguish from real ones, is most strongly constrained on the
+variables that participate in the outcome's structure, and correspondingly unconstrained on
+those that do not. Section 6.3 shows that this is not a harmless liberty.
+
+## Conditional relationships
+
+```{r fid-coef}
+fid$p_coef
+```
+
+```{r fid-coef-tbl}
+fid$strong %>%
+  mutate(across(where(is.numeric), ~ round(.x, 4))) %>%
+  knitr::kable(caption = "Coefficients with an absolute value above 1, before and after synthesis")
+```
+
+Eleven terms have a coefficient larger than one in absolute value in the source data. **Every
+single one of them is smaller in the synthetic data.** Not ten of eleven, and not a majority —
+all eleven, with no exception in either direction. The mean retention ratio is 0.9345, so the
+typical genuine effect is understated by about **6.5%** after synthesis.
+
+The fact that all eleven substantive coefficients move toward zero is difficult to attribute to
+unsystematic sampling variation alone and points to a common attenuation pattern. Because the
+coefficient estimates are correlated and the direction of the pattern was examined after observing
+the data, no simple independent-sign probability is treated here as a formal significance test.
+
+The shrinkage is not uniform in magnitude, however. `study_hours`, by far the dominant
+predictor, retains 98.8% of its coefficient, while the remaining ten retain 92.9% on average.
+The relationship between an effect's size and how well it survives is not statistically
+reliable across only eleven terms, but the largest effect being the best preserved is
+consistent with the marginal-distribution result above: the generator tracks most closely
+what matters most to the outcome.
+
+Because the coefficients above are estimated on standardised predictors, each equals the raw
+slope multiplied by that predictor's standard deviation. If the synthesis altered those standard
+deviations, the attenuation could be an artifact of rescaling rather than a change in the
+underlying relationships. `study_hours`, for instance, has a standard deviation 2.3% larger in
+the synthetic data. The comparison is therefore repeated without standardisation.
+
+```{r fid-raw}
+raw_coefs <- function(d, label) {
+  workflow() %>%
+    add_model(linear_reg() %>% set_engine("lm")) %>%
+    add_recipe(recipe(exam_score ~ ., data = d) %>% step_dummy(all_nominal_predictors())) %>%
+    fit(d) %>% extract_fit_parsnip() %>% broom::tidy() %>%
+    filter(term != "(Intercept)") %>% transmute(term, !!label := estimate)
+}
+
+raw_cmp <- full_join(raw_coefs(orig, "original"), raw_coefs(syn20, "synthetic"),
+                     by = "term") %>%
+  filter(abs(original) > 0.5) %>%
+  mutate(ratio = abs(synthetic) / abs(original))
+
+tibble(
+  Coefficients = c("Standardised (as above)", "Unstandardised"),
+  Terms = c(nrow(fid$strong), nrow(raw_cmp)),
+  `Shrunk toward zero` = c(sum(abs(fid$strong$synthetic) < abs(fid$strong$original)),
+                           sum(raw_cmp$ratio < 1)),
+  `Mean retention` = round(c(mean(abs(fid$strong$synthetic) / abs(fid$strong$original)),
+                             mean(raw_cmp$ratio)), 4)
+) %>% knitr::kable(caption = "Attenuation with and without standardisation")
+```
+
+The attenuation is not an artifact of rescaling. On raw coefficients every substantive term still
+shrinks, and the mean attenuation is marginally larger than on the standardised scale — the
+increase in `study_hours`' spread had been slightly masking the effect rather than creating it.
+
+```{r fid-rank}
+tibble(
+  Subset = c("All terms", "Substantive terms (|coefficient| > 1)", "Null terms (|coefficient| <= 1)"),
+  n = c(nrow(fid$coef_cmp), nrow(fid$strong), nrow(fid$weak)),
+  `Spearman correlation` = round(c(fid$rank_cor, fid$rank_strong, fid$rank_weak), 4)
+) %>% knitr::kable(caption = "Rank preservation of absolute coefficients")
+```
+
+What the synthesis does preserve, and preserve perfectly, is the *ordering* of the genuine
+effects. Among the eleven substantive terms the rank correlation of absolute coefficients is
+exactly 1.000: the synthetic data ranks every real predictor in precisely the order the source
+formula does. An analyst asking which factors matter most would reach the correct answer from
+either dataset; an analyst asking how much any of them matters would be told, consistently,
+that it matters about 6.5% less than it does.
+
+The rank correlation over all twenty-three terms is 0.829, but that figure should not be
+reported on its own. It is depressed by the twelve terms whose true coefficients are
+approximately zero, where ranking is ranking noise — their internal rank correlation is
+-0.210, which is simply what two unrelated orderings look like.
+
+## Manufactured signal
+
+The attenuation of real effects has a counterpart that is arguably more troubling.
+
+```{r fid-weak}
+fid$weak %>%
+  select(term, original, synthetic) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 4))) %>%
+  knitr::kable(caption = "Coefficients of the null predictors")
+```
+
+In the source data, the twelve terms belonging to the five signal-free predictors have a mean
+absolute coefficient of 0.033 — indistinguishable from zero, as they should be, since these
+variables do not enter the formula. In the synthetic data the same twelve terms have a mean
+absolute coefficient of 0.104, **a factor of 3.15 larger**. The generative model did not merely
+weaken the real associations; it invented new ones where none existed.
+
+At a sample size of 20,000 this is not a curiosity. Standard errors on these standardized
+coefficients are around 0.07, so a spurious coefficient of 0.2 is roughly three standard errors
+from zero.
+
+```{r fid-signif}
+fid$signif_tbl %>%
+  filter(significant) %>%
+  knitr::kable(caption = "Null predictors reaching conventional statistical significance")
+```
+
+```{r fid-signif-count}
+fid$signif_tbl %>%
+  count(dataset, significant) %>%
+  knitr::kable(caption = "Null terms significant at the 5% level, by dataset")
+```
+
+In the source data, none of the twelve null terms reaches the 5% level. In the synthetic data,
+two do: the indicators for the `ba` and `bba` degree programmes, at $p = 0.003$ and $p = 0.010$.
+Both belong to `course`, which Section 6.1 identified as the most badly distorted categorical
+variable.
+
+That count on its own is weaker evidence than it first appears, and it is worth being explicit
+about why. Twelve tests at the 5% level produce 0.6 false positives in expectation, and the
+probability of two or more arising by chance is about 12%. Two significant results among twelve
+null terms is therefore elevated but not, by itself, conclusive.
+
+The stronger evidence is the magnitude of the whole set, measured against its own sampling
+uncertainty rather than against the source dataset.
+
+```{r fid-null-se}
+fid$signif_tbl %>%
+  group_by(Dataset = dataset) %>%
+  summarise(`Mean |coefficient|` = mean(abs(estimate)),
+            `Mean standard error` = mean(std.error),
+            `Expected |coefficient| if truly null` = mean(std.error) * sqrt(2 / pi),
+            .groups = "drop") %>%
+  mutate(Ratio = `Mean |coefficient|` / `Expected |coefficient| if truly null`,
+         across(where(is.numeric), ~ round(.x, 4))) %>%
+  knitr::kable(caption = "Null-term coefficients against their own sampling uncertainty")
+```
+
+If a coefficient is truly zero, its estimate is approximately normal with mean zero, so the
+expected absolute estimate is $\sigma\sqrt{2/\pi} \approx 0.798\,\sigma$. In the synthetic data the
+observed mean absolute coefficient is roughly 1.8 times that benchmark; in the source data it is
+below it. The synthesis has left associations in the null predictors that are systematically
+larger than estimation noise alone would produce.
+
+This also qualifies the 3.15-fold ratio reported above. Its denominator — the source dataset's
+mean absolute null coefficient of 0.033 — is itself unusually small, roughly half what its own
+standard errors would lead one to expect. The ratio against sampling uncertainty is the more
+stable comparison, and it is the one on which the conclusion rests.
+
+An analyst working with the synthetic dataset, applying standard methods, could therefore
+conclude that a student's degree programme affects their exam score. In the source data it does
+not.
+
+## Residual structure and apparent predictability
+
+The results so far describe a dataset whose genuine signal has been weakened and whose null
+predictors have acquired spurious associations. It would be natural to expect such a dataset
+to be *harder* to predict. It is easier.
+
+```{r fid-pred}
+knitr::kable(fid$pred_cmp,
+             caption = "Five-fold cross-validated linear model on each dataset")
+```
+
+Under an identical resampling scheme, a linear model reaches a cross-validated RMSE of 9.796
+on the source data and 8.834 on the synthetic data, with $R^2$ rising from 0.732 to 0.782.
+The synthetic dataset appears to permit meaningfully better prediction than the process it was
+built to imitate.
+
+```{r fid-var}
+knitr::kable(fid$var_tbl, caption = "Variance decomposition of the fitted linear model")
+```
+
+The decomposition resolves the apparent contradiction. Total outcome variance is essentially
+unchanged between the two datasets, at 357.5 and 357.2. But **residual variance falls by 18.7%**,
+from 95.7 to 77.8. In other words, the fitted linear model leaves roughly a fifth less unexplained
+variation in the synthetic data. This residual variation can contain stochastic noise, censoring
+effects, and any structure not captured by the linear specification, so it should not be interpreted
+as a direct estimate of irreducible noise. Fitted variance meanwhile rises by 6.7%, reflecting the
+altered predictor distributions and correlations documented in Sections 2.7 and 6.1 rather than
+any strengthening of the underlying relationships, which Section 6.2 showed uniformly weakened.
+
+The pattern is consistent with smoothing during synthesis: the synthetic data preserve central
+tendencies more readily than idiosyncratic variation. The consequence is a dataset that is easier
+for this linear model to predict: the genuine relationships are muted, but the variation left
+unexplained by the model is reduced by even more.
+
+| Property | Verdict | Evidence |
+|---|---|---|
+| Outcome marginal distribution | Preserved almost exactly | Quartiles agree to 0.1 points |
+| Censoring at both bounds | Preserved | 2.52% against 2.46% at the upper bound |
+| Marginals of signal-carrying predictors | Largely preserved | Total variation distance below 1.5 points |
+| Marginals of signal-free predictors | Substantially distorted | `course` moved by 14 percentage points |
+| Ordering of genuine effects | Preserved exactly | Rank correlation 1.000 |
+| Magnitude of genuine effects | Systematically understated | All 11 attenuated, 6.5% on average |
+| Absence of null effects | Not preserved | Null coefficients inflated 3.15-fold; two became significant |
+| Residual variation | Substantially reduced | Linear-model residual variance down 18.7% |
+
+## Limitations
+
+Three qualifications bound what Sections 6.1 to 6.4 can support.
+
+**The identification is an assumption.** As Section 1.3 set out, the claim that the competition
+dataset was generated from this particular source, by a generative model of this particular kind,
+rests on the Playground Series convention, on the structural agreement between the two datasets,
+and on a competitor's published account — not on a statement from the organisers. If the actual
+training data were a different version of the source, then the differences documented here would
+describe a comparison between two datasets rather than a before-and-after of one generator. The
+descriptive findings survive that possibility intact: the two datasets do differ in these specific,
+measurable ways. What would not survive is the causal attribution of those differences to the
+synthesis step.
+
+**The two datasets are not sampled symmetrically.** The source dataset is used in full, while the
+synthetic dataset is a 20,000-row sample stratified on the outcome and drawn from 630,000 rows.
+Because the strata are outcome deciles sampled in equal proportion, the allocation is proportional
+and the coefficient estimates are unbiased. The stratification does, however, suppress sampling
+variation in the synthetic outcome's marginal distribution in a way that no corresponding procedure
+suppresses on the source side. The effect on the residual-variance comparison in Section 6.4 is
+expected to be small, but it is not zero, and a simple random sample would make that comparison
+cleaner.
+
+**The comparisons are point estimates without uncertainty on the difference.** Each coefficient is
+estimated from 20,000 observations, giving standard errors on the standardised scale of roughly
+0.06 to 0.09; the standard error of a difference between the two datasets is larger still. Several
+of the individual attenuations in Section 6.2 are within two or three standard errors of zero. The
+finding rests on the consistency of the pattern across all eleven substantive terms and on its
+survival without standardisation, not on any single coefficient. A paired bootstrap over both
+datasets would put an interval around the mean attenuation and is the natural next step.
+
+## What the synthesis preserved and what it changed
+
+Read as a whole, the table describes a synthesis that is excellent at the tasks generative
+models are usually evaluated on and unreliable at the one that matters for statistical
+practice. Every marginal-distribution check of the outcome passes. Every check of the
+conditional structure that generated it fails in the same direction: effects are smaller,
+nulls are not null, and the fitted linear model leaves substantially less residual variation.
+
+The practical implication is specific rather than general. A researcher who uses this dataset
+to ask *which* variables predict exam performance will get the right answer. One who uses it to
+estimate *how strongly* they do will understate every effect by around six per cent. One who
+uses it to ask *whether* a variable matters at all may find significant effects that do not
+exist. And one who uses it to establish how accurately exam scores can be predicted — the
+question the competition itself poses — will arrive at a figure roughly one RMSE point too
+optimistic.
+
+---
+
+# Conclusion
+
+## Model results
+Five regression families were compared using the same five-fold stratified cross-validation scheme. Elastic net and ordinary linear regression tied for the lowest cross-validated RMSE at 8.8534, while the boosted tree was essentially indistinguishable at 8.8626. Random forest performed noticeably worse at 9.3250, and k-nearest neighbors was substantially worse at 12.0347. The tuned elastic net selected a penalty of 0.001 and a mixture of 1, making it effectively equivalent to ordinary least squares. The model comparison therefore provides little evidence that additional regularization or flexibility improves prediction for this dataset.
+
+The selected elastic-net model was fitted to the full training set and evaluated once on the held-out testing set. It achieved an RMSE of 8.7398, an $R^2$ of 0.7841, and an MAE of 6.9905. The testing RMSE was slightly lower than the five-fold cross-validation estimate, with no indication of substantial overfitting. Residual diagnostics also showed no systematic curvature or change in variance across the interior of the outcome range; the main remaining pattern was concentrated at the censored upper and lower bounds.
+
+This ordering runs against the common expectation that more flexible model families predict
+better on tabular data, and three specific results were unexpected at the outset. The elastic
+net, given the opportunity to shrink or discard the five predictors that Section 2.6 showed
+carry no signal, selected the weakest penalty in the grid and so declined to regularize at all.
+The boosted tree, offered tree depths from 2 to 8, selected 2 — the shallowest permitted, and
+therefore the least capacity to represent interactions. And the random forest, often treated as
+a safe default for problems of this kind, finished 7.6 cross-validation standard errors behind a
+model with 23 coefficients and no hyperparameters.
+
+The exploratory analysis in Section 2 accounts for all three. The relationship between the
+dominant predictor and the outcome is very close to linear (Section 2.4), the predictors are
+almost uncorrelated with one another so that little interaction structure is available to exploit
+(Section 2.3), and roughly half the predictors contribute nothing measurable (Section 2.6). Tree
+ensembles earn their additional variance by discovering nonlinearity and interaction, and in these
+data there is very little of either to discover; a forest asked to reproduce a straight line must
+assemble it from piecewise-constant steps. Distance-based methods fare worse still, because in 23
+dimensions no observation has genuinely near neighbours.
+
+## External benchmarks
+
+This project's accuracy can be placed against two publicly documented solutions to
+the same prediction problem, both of which used the full 630,000-row competition
+dataset rather than the 20,000-row sample used here.
+
+| Approach | Complexity | RMSE |
+|---|---|---|
+| This project, best model | Five families, one machine | **8.740** |
+| Public LightGBM notebook | 33 features, target encoding, 10,025 boosting rounds | 8.706 |
+| Fourth place, best single model (TabM) | Multi-seed averaged neural network | 8.589 |
+| Fourth place, final ensemble | 330 models stacked with ridge regression | 8.566 |
+
+The spread across that table is the point. The fourth-place entrant assembled 330
+models spanning gradient-boosted trees, neural architectures, transformers and
+nearest-neighbour methods, combined them with a ridge meta-learner, and engineered
+dozens of interaction, ratio, polynomial and target-encoded features. The reported
+gain over an ordinary least-squares fit to the same data is approximately 0.33 RMSE,
+or about 3.7%. The publicly shared boosting notebook, using 10,025 rounds, reaches
+8.706; its own logged learning curve shows that 500 rounds had not yet matched a
+plain linear model, that 1,000 rounds captured roughly three quarters of the total
+gain, and that doubling the budget from 5,000 to 10,000 rounds bought a further 0.013.
+
+Two qualifications are needed before reading too much into the comparison. First,
+those figures come from the full dataset, which as Section 7 shows is where flexible
+models do best; the sample used here is deliberately smaller. Second, they are
+cross-validated or leaderboard scores computed under different resampling schemes,
+so they are indicative rather than strictly commensurable.
+
+## Methodological conclusions
+
+Two findings deserve to be carried away from this project, and they are connected.
+
+The first concerns model selection. Complexity is not a free option. Each of the flexible families
+tested here pays for its flexibility in variance, and that price is only worth paying when there is
+structure to be found in exchange. Where the data-generating process is close to linear and
+additive — as it is here, and as it is in a great many applied problems — the simplest model in the
+catalogue is not a baseline to be beaten but a serious competitor, and in this case the winner.
+Exploratory analysis is what makes this predictable rather than surprising: Sections 2.3 and 2.4
+forecast the outcome of Section 4.7 before any model had been fitted.
+
+The second concerns the data itself, and is the more general result. Section 6 established that the
+generative synthesis behind the competition dataset preserved the outcome's marginal distribution
+almost exactly while systematically distorting its conditional structure: every genuine effect was
+attenuated, by 6.5% on average and without a single exception among eleven; null predictors acquired
+spurious coefficients three times their original magnitude, two of which reached conventional
+statistical significance; and linear-model residual variance was reduced by nearly a fifth.
+
+The consequence is that synthetic data of this kind is **simultaneously too easy and misleading**.
+It is too easy because the linear model leaves nearly a fifth less residual variation in the synthetic
+data, raising its $R^2$ and lowering its RMSE relative to the process being imitated — it scores 8.83
+on the synthetic data against 9.80 on its source. It is misleading because the effects an analyst
+would estimate from it are uniformly understated, and because variables with no relationship to the
+outcome can emerge as statistically significant.
+
+These two conclusions bear on each other. A common justification for reaching first for a gradient
+boosting machine is that real tabular data is full of interaction and nonlinearity that linear models
+cannot capture. That may well be true of real data. It is measurably less true of data that has been
+through a generative model, which smooths precisely the irregularities that flexible methods exist to
+exploit. Benchmarking model families on synthetic datasets may therefore understate the advantage of
+flexible methods — while simultaneously overstating how accurately the underlying problem can be
+solved at all.
+
+## Future work
+
+Four extensions follow directly from what this project found.
+
+**Model the censoring explicitly.** Section 5.3 showed that the outcome is clipped at both bounds and
+that residuals at the boundaries average $+8.3$ and $-9.7$. A Tobit or other censored-regression
+specification would model the boundary mechanism explicitly and could improve predictive performance,
+particularly near the censored limits.
+
+**Repeat the fidelity comparison on other generators.** The attenuation documented in Section 6 is a
+property of one synthesis of one dataset. Whether the same pattern — marginals preserved, conditional
+effects shrunk, nulls inflated, residual variation reduced — appears under other tabular generators such as
+diffusion models, variational autoencoders, or copula-based methods is an open and answerable question.
+If it generalises, a straightforward correction factor for effect sizes estimated from synthetic data
+becomes plausible.
+
+**Vary the sample size systematically.** All comparisons here were made at a matched 20,000
+observations, chosen so that the synthetic dataset and its source could be compared without
+sample size confounding the result. Preliminary work on the full 630,000-row competition dataset
+suggests the ranking of model families changes at larger sample sizes, with gradient boosting
+overtaking the linear model once the variance penalty for flexibility becomes affordable. Mapping
+where that crossover occurs would quantify what sample size a flexible model requires before its
+flexibility pays.
+
+**Find the source of the residual gap.** The public solutions cited in Section 7.2 reach roughly 0.3
+RMSE below a linear model on the full dataset. Splines on the numeric predictors and exhaustive two-way
+interactions each recover only a small fraction of that margin, which suggests the remainder lies in
+higher-order structure. Whether that structure reflects anything about student performance, or is
+simply a fingerprint of the generative model that produced the data, is the question this project
+would ask next.
+
+---
+
+# References
+
+Kaggle. *Playground Series — Season 6, Episode 1: Predicting Student Test Scores.*
+Kaggle, 2026. https://www.kaggle.com/competitions/playground-series-s6e1
+
+Lim, Y. J. *First Loser (aka 4th Place).* Kaggle, 2026.
+https://www.kaggle.com/competitions/playground-series-s6e1/writeups/first-loser-aka-4th-place
+
+Bedmutha, K. S. *Exam Score Prediction Dataset.* Kaggle, 2025.
+https://www.kaggle.com/datasets/kundanbedmutha/exam-score-prediction-dataset
+
+lopure. *PS S6E1 | EDA + XGB — Last Competition Starter (as it is).* Kaggle, 2026.
+https://www.kaggle.com/code/lopure/ps-s6e1-eda-xgb-last-competition-starter-as-it-is
+
+Kawamata, M. *S5E12 — EDA and XGBoost Competition Starter.* Kaggle, 2025.
+https://www.kaggle.com/code/masayakawamata/s5e12-eda-xgb-competition-starter
+(the notebook cited above is an adaptation of this one, for the preceding competition)
+
+Kuhn, M., and Silge, J. *Tidy Modeling with R.* O'Reilly Media, 2022.
+https://www.tmwr.org/
+
+James, G., Witten, D., Hastie, T., and Tibshirani, R. *An Introduction to Statistical
+Learning with Applications in R.* 2nd ed. Springer, 2021.
